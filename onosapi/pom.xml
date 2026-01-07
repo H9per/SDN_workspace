@@ -58,6 +58,26 @@
             <version>${onos.version}</version>
             <scope>provided</scope>
         </dependency>
+
+        <!-- P4Runtime & Pipeconf Dependencies -->
+        <dependency>
+            <groupId>org.onosproject</groupId>
+            <artifactId>onos-protocols-p4runtime-model</artifactId>
+            <version>${onos.version}</version>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.onosproject</groupId>
+            <artifactId>onos-protocols-p4runtime-api</artifactId>
+            <version>${onos.version}</version>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.onosproject</groupId>
+            <artifactId>onos-drivers-p4runtime</artifactId>
+            <version>${onos.version}</version>
+            <scope>provided</scope>
+        </dependency>
     </dependencies>
 
     <!-- 3. 【关键】添加仓库地址，否则无法下载 ONOS 插件 -->

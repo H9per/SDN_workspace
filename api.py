@@ -1,161 +1,196 @@
-import requests
-from requests.auth import HTTPBasicAuth
-import json
+from flask import Flask, request, jsonify
+import logging
+import threading
+import time
+import copy
+import onos_api
+from topology_manager import TopologyGraph
 
-# ONOS 配置
-ONOS_IP = '127.0.0.1'
-ONOS_PORT = '8181'
-USER = 'karaf'
-PASS = 'karaf'
-BASE_URL = f'http://{ONOS_IP}:{ONOS_PORT}/onos/v1'
+app = Flask(__name__)
 
-def _get_auth():
-    return HTTPBasicAuth(USER, PASS)
+# 配置日志
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-def clean_flows(except_id="org.onosproject.core"):
-    """
-    删除除指定 ID 以外的所有流表。
-    :param except_id: 不需要删除的 App ID，默认为 'org.onosproject.core'
-    """
-    print(f"正在清理流表，保留 App ID: {except_id}...")
-    try:
-        resp = requests.get(f'{BASE_URL}/flows', auth=_get_auth())
-        if resp.status_code != 200:
-            print(f"获取流表失败: {resp.status_code} {resp.text}")
-            return False
+# 全局拓扑对象
+global_graph = None
+APP_ID = "org.example.arp"
+
+# 流表模板
+flows_template = {
+  "priority": 40001,
+  "timeout": 0,
+  "isPermanent": True,
+  "deviceId": "",
+  "selector": {
+    "criteria": [
+      {
+        "type": "IN_PORT",
+        "port": ""
+      },
+      {
+        "type": "ETH_DST",
+        "mac": ""
+      }
+    ]
+  },
+  "treatment": {
+    "instructions": [
+      {
+        "type": "OUTPUT",
+        "port": ""
+      }
+    ]
+  }
+}
+
+def update_topology_task():
+    """每 5 秒更新一次拓扑"""
+    global global_graph
+    while True:
+        try:
+            logger.info("正在更新网络拓扑...")
+            links = onos_api.get_links_by_topology_id()
+            hosts = onos_api.get_hosts()
+            global_graph = TopologyGraph(links, hosts)
+            logger.info(f"拓扑更新完成: {len(global_graph.get_all_devices())} devices, {len(hosts)} hosts")
+            
+        except Exception as e:
+            logger.error(f"拓扑更新失败: {e}")
         
-        flows = resp.json().get('flows', [])
-        apps_to_clean = set()
+        time.sleep(5)
+
+def cleanup_conflicting_flows(device_id, match_criteria):
+    try:
+        flows = onos_api.get_flows(device_id)
+        if not flows:
+            return
+
+        target_eth_dst = match_criteria.get("ETH_DST")
+        target_in_port = match_criteria.get("IN_PORT")
+
         for flow in flows:
-            app_id = flow.get('appId')
-            if app_id and app_id != except_id:
-                apps_to_clean.add(app_id)
-        if not apps_to_clean:
-            print("没有需要清理的流表。")
-            return True
-        
-        for app_id in apps_to_clean:
-            print(f"正在删除 App ID 为 {app_id} 的流表 ...")
-            del_resp = requests.delete(f'{BASE_URL}/flows/application/{app_id}', auth=_get_auth())
-            if del_resp.status_code == 204:
-                print(f"  成功删除 {app_id} 的流表")
-            else:
-                print(f"  删除失败 {app_id}: {del_resp.status_code}")
-        
-        print("流表清理完成。")
-        return True
+            flow_app_id = flow.get("appId")
+            if flow_app_id != APP_ID:
+                continue
 
+            criteria_list = flow.get("selector", {}).get("criteria", [])
+            
+            # ONOS criteria 示例: {"type": "ETH_DST", "mac": "..."}
+            criteria_map = {c.get("type"): c for c in criteria_list}
+
+            existing_mac = criteria_map.get("ETH_DST", {}).get("mac")
+
+            if existing_mac and existing_mac.upper() == target_eth_dst.upper():
+                logger.info(f"清理旧流表: dev={device_id}, flowId={flow.get('id')}, mac={existing_mac}")
+                onos_api.delete_flow(device_id, flow.get('id'))
+                time.sleep(0.1) 
+            
     except Exception as e:
-        print(f"clean_flows 发生错误: {e}")
+        logger.warning(f"清理流表异常: {e}")
+
+def install_path_flows(src_host_id, dst_host_id, src_mac, dst_mac):
+    if not global_graph:
+        logger.warning("拓扑尚未就绪")
         return False
-
-def get_flows_by_device_id(device_id=None):
-    """
-    根据设备 ID 获取流表。如果未提供 device_id，则获取所有流表。
-    :param device_id: 设备 ID (例如 'of:0000000000000001')，可选
-    :return: 流表列表
-    """
-    try:
-        if device_id:
-            url = f'{BASE_URL}/flows/{device_id}'
-        else:
-            url = f'{BASE_URL}/flows'
-
-        resp = requests.get(url, auth=_get_auth())
-        if resp.status_code == 200:
-            return resp.json().get('flows', [])
-        else:
-            target = device_id if device_id else "所有"
-            print(f"获取 {target} 流表失败: {resp.status_code}")
-            return []
-    except Exception as e:
-        print(f"get_flows_by_device_id 发生错误: {e}")
-        return []
-
-def get_devices_by_topology_id(topology_id=None):
-    """
-    基于拓扑 ID (Cluster ID) 获取拓扑内的设备列表。
-    如果 topology_id 为 None，则获取所有设备。
-    :param topology_id: 拓扑集群 ID (例如 '0')
-    :return: 设备列表
-    """
-    try:
-        if topology_id is not None:
-            url = f'{BASE_URL}/topology/clusters/{topology_id}/devices'
-        else:
-            url = f'{BASE_URL}/devices'
-            
-        resp = requests.get(url, auth=_get_auth())
-        if resp.status_code == 200:
-            return resp.json().get('devices', [])
-        else:
-            print(f"获取设备列表失败 (topology_id={topology_id}): {resp.status_code}")
-            return []
-    except Exception as e:
-        print(f"get_devices_by_topology_id 发生错误: {e}")
-        return []
-
-def get_links_by_topology_id(topology_id=None):
-    """
-    基于拓扑 ID (Cluster ID) 获取拓扑内的链路。
-    如果 topology_id 为 None，则获取所有链路。
-    :param topology_id: 拓扑集群 ID (例如 '0')
-    :return: 链路列表
-    """
-    try:
-        if topology_id is not None:
-            url = f'{BASE_URL}/topology/clusters/{topology_id}/links'
-        else:
-            url = f'{BASE_URL}/links'
-            
-        resp = requests.get(url, auth=_get_auth())
-        if resp.status_code == 200:
-            return resp.json().get('links', [])
-        else:
-            print(f"获取链路列表失败 (topology_id={topology_id}): {resp.status_code}")
-            return []
-    except Exception as e:
-        print(f"get_links_by_topology_id 发生错误: {e}")
-        return []
-    
-def create_flow(flow_data,device_id=None,appId="org.onosproject.emptyId"):
-    """
-    在指定设备上创建流表。如果未提供 device_id，则创建全局流表。
-    :param flow_data: 流表数据 (字典格式)
-    :param device_id: 设备 ID (例如 'of:0000000000000001')，可选
-    :return: 创建结果 (True/False)
-    """
-    try:
-        if device_id:
-            url = f'{BASE_URL}/flows/{device_id}?appId={appId}'
-        else:
-            url = f'{BASE_URL}/flows/?appId={appId}'
-        
-        headers = {'Content-Type': 'application/json'}
-        resp = requests.post(url, auth=_get_auth(), headers=headers, data=json.dumps(flow_data))
-        if resp.status_code in [200, 201]:
-            print(f"流表创建成功 (device_id={device_id})")
-            return True
-        else:
-            print(f"流表创建失败 (device_id={device_id}): {resp.status_code} {resp.text}")
+    path = global_graph.find_path(src_host_id, dst_host_id)
+    if not path:
+        logger.warning(f"找不到路径: {src_host_id} -> {dst_host_id}")
+        return False
+    for i in range(1, len(path) - 1):
+        prev_node = path[i-1]
+        curr_node = path[i]
+        next_node = path[i+1]
+        if not curr_node.startswith("of:"):
+            continue
+        link_in = global_graph.get_port_to_neighbor(prev_node, curr_node)
+        link_out = global_graph.get_port_to_neighbor(curr_node, next_node)
+        if not link_in or not link_out:
+            logger.error(f"链路缺失: {prev_node}-{curr_node}-{next_node}")
             return False
-    except Exception as e:
-        print(f"create_flow 发生错误: {e}")
-        return False
+        in_port = link_in['dst_port']
+        out_port = link_out['src_port']
+        install_flow_rule(curr_node, in_port, out_port, dst_mac)
+        install_flow_rule(curr_node, out_port, in_port, src_mac)
+
+    return True
+
+def install_flow_rule(device_id, in_port, out_port, match_dst_mac):
+    match_criteria = {
+        "ETH_DST": match_dst_mac,
+        "IN_PORT": in_port
+    }
+    cleanup_conflicting_flows(device_id, match_criteria)
     
-def get_hosts():
-    """
-    获取网络中的所有主机信息。
-    :return: 主机列表
-    """
+    # 3. 构造新流表
+    flow = copy.deepcopy(flows_template)
+    flow["deviceId"] = device_id
+    # 入端口
+    flow["selector"]["criteria"][0]["port"] = in_port
+    # 目的MAC
+    flow["selector"]["criteria"][1]["mac"] = match_dst_mac
+    # 从出端口转发
+    flow["treatment"]["instructions"][0]["port"] = out_port
+    
+    logger.info(f"下发流表: Dev={device_id} Match=[In:{in_port}, Dst:{match_dst_mac}] -> Out:{out_port}")
+    onos_api.create_flow(flow, device_id, appId=APP_ID)
+
+@app.route('/api/report/arp', methods=['POST'])
+def report_arp():
     try:
-        url = f'{BASE_URL}/hosts'
-        resp = requests.get(url, auth=_get_auth())
-        if resp.status_code == 200:
-            return resp.json().get('hosts', [])
+        data = request.json
+        if not data:
+            return jsonify({"status": "error", "message": "No JSON data"}), 400
+        dpid = data.get('dpid')
+        port = data.get('port')
+        src_ip = data.get('src_ip')
+        src_mac = data.get('src_mac')
+        dst_ip = data.get('dst_ip')
+        logger.info(f"收到 ARP 上报: SRC[{src_ip}/{src_mac}] -> DST[{dst_ip}] @ {dpid}:{port}")
+        target_host = None
+        target_mac = None
+        if global_graph:
+            hosts = onos_api.get_hosts()
+            for h in hosts:
+                if dst_ip in h.get('ipAddresses', []):
+                    target_host = h['id']
+                    target_mac = h['mac']
+                    break
+        
+        if target_host:
+            src_host_id = f"{src_mac}/None" 
+            success = install_path_flows(src_host_id, target_host, src_mac, target_mac) # src_host_id is guessed
+            
+            if success:
+                #代答 ARP 
+                response_payload = {
+                    "action": "packet-out",
+                    "payload": {
+                        "type": "ARP_REPLY",
+                        "dpid": dpid,
+                        "port": port,
+                        "src_mac": target_mac, # 目标主机
+                        "src_ip": dst_ip,
+                        "dst_mac": src_mac,    # 请求者
+                        "dst_ip": src_ip
+                    }
+                }
+                return jsonify(response_payload), 200
+            else:
+                logger.warning("路径安装失败，无法代答")
         else:
-            print(f"获取主机列表失败: {resp.status_code}")
-            return []
+            logger.info("目标主机未知，无法处理 (等待目标主机发包)")
+            # 此时无法做任何事，从网络视角看，ARP 会超时
+        
+        return jsonify({"status": "success", "message": "No path or host found"}), 200
+        
     except Exception as e:
-        print(f"get_hosts 发生错误: {e}")
-        return []
+        logger.error(f"处理异常: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+if __name__ == '__main__':
+    topo_thread = threading.Thread(target=update_topology_task, daemon=True)
+    topo_thread.start()
+    
+    logger.info("启动 ARP 监听微服务 (Port 5000)...")
+    app.run(host='0.0.0.0', port=5000)

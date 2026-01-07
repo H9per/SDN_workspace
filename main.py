@@ -1,4 +1,4 @@
-import api
+import onos_api
 import json
 import sys
 from topology_manager import TopologyGraph
@@ -38,12 +38,12 @@ if __name__ == "__main__":
             topo = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         print("topo.json not found or invalid, fetching from api...")
-        topo = api.get_links_by_topology_id()
+        topo = onos_api.get_links_by_topology_id()
         if topo:
             with open('topo.json', 'w') as f:
                 json.dump(topo, f, indent=2)
     
-    hosts = api.get_hosts()
+    hosts = onos_api.get_hosts()
 
     # 2. 初始化图结构
     graph = TopologyGraph(topo, hosts)
@@ -105,7 +105,7 @@ if __name__ == "__main__":
             flow["selector"]["criteria"][0]["port"] = in_port
             flow["treatment"]["instructions"][0]["port"] = out_port
             
-            api.create_flow(flow, device_id=curr_node, appId=appId)
+            onos_api.create_flow(flow, device_id=curr_node, appId=appId)
 
             # 构建流表 (反向)
             print(f"Configuring {curr_node} (Return): IN_PORT={out_port} -> OUTPUT={in_port}")
@@ -114,7 +114,7 @@ if __name__ == "__main__":
             flow_return["selector"]["criteria"][0]["port"] = out_port
             flow_return["treatment"]["instructions"][0]["port"] = in_port
             
-            api.create_flow(flow_return, device_id=curr_node, appId=appId)
+            onos_api.create_flow(flow_return, device_id=curr_node, appId=appId)
 
     else:
         print(f"No path found from {start_node} to {end_node}")

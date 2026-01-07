@@ -1,6 +1,7 @@
 package org.example;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.onlab.packet.ARP;
 import org.onlab.packet.Ethernet;
@@ -11,8 +12,12 @@ import org.onosproject.core.CoreService;
 import org.onosproject.net.DeviceId;
 import org.onosproject.net.PortNumber;
 import org.onosproject.net.flow.DefaultTrafficSelector;
+import org.onosproject.net.flow.DefaultTrafficTreatment;
 import org.onosproject.net.flow.TrafficSelector;
+import org.onosproject.net.flow.TrafficTreatment;
+import org.onosproject.net.packet.DefaultOutboundPacket;
 import org.onosproject.net.packet.InboundPacket;
+import org.onosproject.net.packet.OutboundPacket;
 import org.onosproject.net.packet.PacketContext;
 import org.onosproject.net.packet.PacketPriority;
 import org.onosproject.net.packet.PacketProcessor;
@@ -29,6 +34,7 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.ByteBuffer;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -52,7 +58,7 @@ public class AppComponent {
     private HttpClient httpClient;
 
     // 微服务地址
-    private static final String MICROSERVICE_URL = "http://127.0.0.1:5000/api/report/arp";
+    private static final String MICROSERVICE_URL = "http://172.21.248.221:5000/api/report/arp";
 
     @Activate
     protected void activate() {
@@ -158,7 +164,11 @@ public class AppComponent {
 
             if (response.statusCode() == 200) {
                 log.info("微服务处理成功: " + response.body());
-                // 这里如果微服务返回了路径指令，你可以解析并在这里调用 FlowRuleService 下流表
+                // 解析响应，查看是否有 Packet-Out 指令
+                JsonNode responseJson = mapper.readTree(response.body());
+                if (responseJson.has("action") && "packet-out".equals(responseJson.get("action").asText())) {
+                    handlePacketOutInstruction(responseJson.get("payload"));
+                }
             } else {
                 log.warn("微服务返回错误: " + response.statusCode());
             }
@@ -166,5 +176,50 @@ public class AppComponent {
         } catch (Exception e) {
             log.error("上报微服务失败: " + e.getMessage());
         }
+    }
+
+    private void handlePacketOutInstruction(JsonNode payload) {
+        try {
+            DeviceId dpid = DeviceId.deviceId(payload.get("dpid").asText());
+            PortNumber port = PortNumber.portNumber(payload.get("port").asText());
+            String type = payload.get("type").asText();
+
+            if ("ARP_REPLY".equals(type)) {
+                MacAddress srcMac = MacAddress.valueOf(payload.get("src_mac").asText());
+                Ip4Address srcIp = Ip4Address.valueOf(payload.get("src_ip").asText());
+                MacAddress dstMac = MacAddress.valueOf(payload.get("dst_mac").asText());
+                Ip4Address dstIp = Ip4Address.valueOf(payload.get("dst_ip").asText());
+
+                // 构造 ARP Reply
+                Ethernet ethReply = new Ethernet();
+                ethReply.setSourceMACAddress(srcMac);
+                ethReply.setDestinationMACAddress(dstMac);
+                ethReply.setEtherType(Ethernet.TYPE_ARP);
+
+                ARP arpReply = new ARP();
+                arpReply.setOpCode(ARP.OP_REPLY);
+                arpReply.setProtocolType(ARP.PROTO_TYPE_IP);
+                arpReply.setHardwareType(ARP.HW_TYPE_ETHERNET);
+                arpReply.setProtocolAddressLength((byte) 4);
+                arpReply.setHardwareAddressLength((byte) 6);
+                arpReply.setSenderHardwareAddress(srcMac.toBytes());
+                arpReply.setSenderProtocolAddress(srcIp.toOctets());
+                arpReply.setTargetHardwareAddress(dstMac.toBytes());
+                arpReply.setTargetProtocolAddress(dstIp.toOctets());
+
+                ethReply.setPayload(arpReply);
+
+                emitPacket(dpid, port, ethReply);
+            }
+        } catch (Exception e) {
+            log.error("Packet-Out 执行失败: " + e.getMessage());
+        }
+    }
+
+    private void emitPacket(DeviceId dpid, PortNumber port, Ethernet eth) {
+        TrafficTreatment treatment = DefaultTrafficTreatment.builder().setOutput(port).build();
+        OutboundPacket packet = new DefaultOutboundPacket(dpid, treatment, ByteBuffer.wrap(eth.serialize()));
+        packetService.emit(packet);
+        log.info("已发送 Packet-Out 到: {}/{}", dpid, port);
     }
 }

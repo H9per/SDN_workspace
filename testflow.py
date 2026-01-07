@@ -1,4 +1,4 @@
-import api
+import onos_api
 
 
 flow_data = {
@@ -24,4 +24,4 @@ flow_data = {
   }
 }
 
-api.create_flow(flow_data,device_id='of:0000000000000001',appId="org.onosproject.emptyId")
+onos_api.create_flow(flow_data,device_id='of:0000000000000001',appId="org.onosproject.emptyId")
