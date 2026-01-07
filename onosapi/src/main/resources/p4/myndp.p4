@@ -40,6 +40,7 @@ header myndp_t {
     bit<32> seq_id;
     bit<48> tx_timestamp;
     bit<32> sw_id;
+    bit<32> src_port; // Source Port (out port of the sender)
 }
 
 // Packet-in/Packet-out metadata (Standard for ONOS)
@@ -163,33 +164,36 @@ control MyIngress(inout headers hdr,
         default_action = drop();
     }
 
+    const bit<16> TYPE_IPV4 = 0x0800;
+    const bit<16> TYPE_MYNDP = 0x8899;
+    const bit<16> TYPE_ARP  = 0x0806;
+
+    // ... (中间代码保持不变) ...
+
     apply {
-        // 如果是从 CPU 来的 (Packet-Out)
+        // 1. Packet-Out 处理 (控制器发出的包)
         if (hdr.packet_out.isValid()) {
-            
-            // 如果是 MyNDP 包（例如控制器发出的探测包）
-            // 我们可以在离开交换机前打上当前的时间戳，表示“发送时间”
             if (hdr.myndp.isValid()) {
                  add_timestamp();
             }
-
             standard_metadata.egress_spec = hdr.packet_out.egress_port;
-            hdr.packet_out.setInvalid(); // 移除 header，避免发出去
+            hdr.packet_out.setInvalid();
             return;
         }
 
-        // 拦截自定义 NDP 协议
+        // 2. 自定义 NDP 探测包处理
         if (hdr.myndp.isValid()) {
-            // 如果是探测包 (msg_type=1)，且收到了，说明是邻居发过来的
-            // 我们记录接收时间（这里其实已经由 parser 后的 standard_metadata 记录了 ingress 时间）
-            // 在上送控制器前，我们把这个包在“本交换机接收的时刻”也打进去，或者就保留源时间戳？
-            // 需求是：源交换机发出时打 tx_timestamp。
-            
-            // 这里为了演示：不做修改，直接上送，让控制器计算 (Now - tx_timestamp)
             send_to_cpu();
             return;
         }
-        // 普通 L2 转发
+
+        // 3. ARP 处理: 必须上送控制器以触发主机发现和路径流表下发
+        if (hdr.ethernet.etherType == TYPE_ARP) {
+            send_to_cpu();
+            return;
+        }
+
+        // 4. 普通 L2 转发 (匹配目的 MAC)
         t_l2_fwd.apply();
     }
 }
@@ -203,6 +207,12 @@ control MyEgress(inout headers hdr,
                  inout standard_metadata_t standard_metadata) {
 
     apply {
+        // 如果是 MyNDP 数据包且不是发往控制器，说明是发出的探测包
+        // 将当前的出口端口 (Egress Port) 写入 src_port 字段
+        if (hdr.myndp.isValid() && standard_metadata.egress_port != 255) {
+            hdr.myndp.src_port = (bit<32>)standard_metadata.egress_port;
+        }
+
         // 如果目标是 CPU (端口 255)，添加 Packet-In 头部
         if (standard_metadata.egress_port == 255) {
             hdr.packet_in.setValid();

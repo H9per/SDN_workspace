@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Active Probing Topology</title>
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <style>
+        body { font-family: sans-serif; overflow: hidden; margin: 0; }
+        svg { width: 100vw; height: 100vh; background-color: #f5f5f5; }
+        .links line { stroke: #999; stroke-opacity: 0.6; stroke-width: 3px; }
+        .nodes circle { stroke: #fff; stroke-width: 1.5px; cursor: pointer; }
+        text { font-size: 11px; font-weight: bold; pointer-events: none; text-shadow: 1px 1px 2px white; }
+    </style>
+</head>
+<body>
+    <div style="position: absolute; top: 10px; left: 10px; background: rgba(255,255,255,0.8); padding: 10px; border-radius: 5px; pointer-events: none;">
+        <h3>Network Topology</h3>
+        <p><span style="color:red">●</span> Host <span style="color:steelblue">●</span> Switch</p>
+    </div>
+    <div id="graph-container"></div>
+
+    <script>
+        const width = window.innerWidth;
+        const height = window.innerHeight;
+        
+        const svg = d3.select("#graph-container").append("svg")
+            .attr("width", width)
+            .attr("height", height);
+
+        const container = svg.append("g");
+
+        // Zoom Behavior
+        const zoom = d3.zoom()
+            .scaleExtent([0.1, 8])
+            .on("zoom", (event) => {
+                container.attr("transform", event.transform);
+            });
+        
+        svg.call(zoom);
+
+        // Define arrow marker
+        svg.append("defs").selectAll("marker")
+            .data(["end"])
+            .enter().append("marker")
+            .attr("id", "arrow")
+            .attr("viewBox", "0 -5 10 10")
+            .attr("refX", 18)
+            .attr("refY", 0)
+            .attr("markerWidth", 6)
+            .attr("markerHeight", 6)
+            .attr("orient", "auto")
+            .append("path")
+            .attr("d", "M0,-5L10,0L0,5");
+
+        const linkGroup = container.append("g").attr("class", "links");
+        const labelGroup = container.append("g").attr("class", "labels");
+        const nodeGroup = container.append("g").attr("class", "nodes");
+        const textGroup = container.append("g").attr("class", "node-texts");
+
+        let simulation = d3.forceSimulation()
+            .force("link", d3.forceLink().id(d => d.id).distance(200))
+            .force("charge", d3.forceManyBody().strength(-800))
+            .force("center", d3.forceCenter(width / 2, height / 2))
+            .force("collide", d3.forceCollide(50));
+
+        let currentNodes = [];
+        let currentLinks = [];
+
+        function updateGraph() {
+            fetch('/api/topology')
+                .then(response => response.json())
+                .then(data => {
+                    const newNodes = data.nodes;
+                    const newLinks = data.links;
+
+                    const isSameStructure = checkStructure(currentNodes, currentLinks, newNodes, newLinks);
+
+                    if (isSameStructure) {
+                        updateLabels(newLinks);
+                        return; 
+                    }
+
+                    // Map old positions
+                    const nodeMap = new Map(currentNodes.map(n => [n.id, n]));
+                    
+                    currentNodes = newNodes.map(n => {
+                        const old = nodeMap.get(n.id);
+                        if (old) {
+                            return { ...n, x: old.x, y: old.y, vx: old.vx, vy: old.vy };
+                        }
+                        return { ...n };
+                    });
+
+                    currentLinks = newLinks.map(l => ({...l}));
+
+                    render();
+                });
+        }
+
+        function checkStructure(oldNodes, oldLinks, newNodes, newLinks) {
+            if (oldNodes.length !== newNodes.length) return false;
+            if (oldLinks.length !== newLinks.length) return false;
+
+            const oldNodeIds = new Set(oldNodes.map(n => n.id));
+            for (let n of newNodes) {
+                if (!oldNodeIds.has(n.id)) return false;
+            }
+
+            // Check links by source-target key
+            const oldLinkKeys = new Set(oldLinks.map(l => {
+                 let s = l.source.id || l.source;
+                 let t = l.target.id || l.target;
+                 return s + "-" + t;
+            }));
+            
+            for (let l of newLinks) {
+                const key = l.source + "-" + l.target;
+                if (!oldLinkKeys.has(key)) return false;
+            }
+
+            return true;
+        }
+
+        function updateLabels(newLinks) {
+             const fwMap = {};
+             const revMap = {};
+             
+             newLinks.forEach(l => {
+                 const key = l.source + "-" + l.target;
+                 fwMap[key] = l.latency_fwd;
+                 revMap[key] = l.latency_rev;
+             });
+
+             labelGroup.selectAll(".fwd-label")
+                .text(d => {
+                    const key = d.source.id + "-" + d.target.id;
+                    return fwMap[key] > 0 ? fwMap[key] + "ms" : "";
+                })
+                .attr("fill", d => {
+                     const key = d.source.id + "-" + d.target.id;
+                     return fwMap[key] > 5 ? "red" : "black";
+                });
+
+             labelGroup.selectAll(".rev-label")
+                .text(d => {
+                    const key = d.source.id + "-" + d.target.id;
+                    return revMap[key] > 0 ? revMap[key] + "ms" : "";
+                })
+                .attr("fill", d => {
+                     const key = d.source.id + "-" + d.target.id;
+                     return revMap[key] > 5 ? "red" : "black";
+                });
+        }
+
+        function render() {
+            // Nodes
+            let node = nodeGroup.selectAll("circle").data(currentNodes, d => d.id);
+            node.exit().remove();
+            
+            const nodeEnter = node.enter().append("circle")
+                .attr("r", 15)
+                // 1=Switch (Blue), 2=Host (Red)
+                .attr("fill", d => d.group === 1 ? "#1f77b4" : "#d62728")
+                .call(d3.drag()
+                    .on("start", dragstarted)
+                    .on("drag", dragged)
+                    .on("end", dragended));
+            
+            node = nodeEnter.merge(node);
+
+            // Node Texts (ID)
+            let text = textGroup.selectAll("text").data(currentNodes, d => d.id);
+            text.exit().remove();
+            const textEnter = text.enter().append("text")
+                .attr("dy", 25)
+                .attr("text-anchor", "middle")
+                .text(d => d.id);
+            text = textEnter.merge(text);
+
+            // Links
+            let link = linkGroup.selectAll("line").data(currentLinks, d => d.source + "-" + d.target);
+            link.exit().remove();
+            const linkEnter = link.enter().append("line");
+            link = linkEnter.merge(link);
+
+            // Link Labels (Group contains 2 texts)
+            let labels = labelGroup.selectAll("g").data(currentLinks, d => d.source + "-" + d.target);
+            labels.exit().remove();
+            
+            const labelsEnter = labels.enter().append("g");
+            
+            // FWD Latency (Near Source)
+            labelsEnter.append("text")
+                .attr("class", "fwd-label")
+                .attr("text-anchor", "middle")
+                .text(d => d.latency_fwd > 0 ? d.latency_fwd + "ms" : "")
+                .attr("fill", d => d.latency_fwd > 5 ? "red" : "black");
+
+            // REV Latency (Near Target)
+            labelsEnter.append("text")
+                .attr("class", "rev-label")
+                .attr("text-anchor", "middle")
+                .text(d => d.latency_rev > 0 ? d.latency_rev + "ms" : "")
+                .attr("fill", d => d.latency_rev > 5 ? "red" : "black");
+
+            labels = labelsEnter.merge(labels);
+
+            simulation.nodes(currentNodes).on("tick", ticked);
+            simulation.force("link").links(currentLinks);
+            simulation.alpha(1).restart();
+
+            function ticked() {
+                link
+                    .attr("x1", d => d.source.x)
+                    .attr("y1", d => d.source.y)
+                    .attr("x2", d => d.target.x)
+                    .attr("y2", d => d.target.y);
+
+                node
+                    .attr("cx", d => d.x)
+                    .attr("cy", d => d.y);
+                
+                text
+                    .attr("x", d => d.x)
+                    .attr("y", d => d.y);
+                
+                // Position labels at 25% and 75% of the link
+                // FWD label (Src -> Tgt) put at 1/4 distance from Src
+                labels.selectAll(".fwd-label")
+                    .attr("x", d => d.source.x + (d.target.x - d.source.x) * 0.25)
+                    .attr("y", d => d.source.y + (d.target.y - d.source.y) * 0.25 - 8);
+
+                // REV label (Tgt -> Src) put at 3/4 distance from Src (1/4 from Tgt)
+                labels.selectAll(".rev-label")
+                    .attr("x", d => d.source.x + (d.target.x - d.source.x) * 0.75)
+                    .attr("y", d => d.source.y + (d.target.y - d.source.y) * 0.75 + 18);
+            }
+        }
+
+        function dragstarted(event, d) {
+            if (!event.active) simulation.alphaTarget(0.3).restart();
+            d.fx = d.x;
+            d.fy = d.y;
+        }
+
+        function dragged(event, d) {
+            d.fx = event.x;
+            d.fy = event.y;
+        }
+
+        function dragended(event, d) {
+            if (!event.active) simulation.alphaTarget(0);
+            d.fx = null;
+            d.fy = null;
+        }
+
+        updateGraph();
+        setInterval(updateGraph, 2000);
+
+    </script>
+</body>
+</html>

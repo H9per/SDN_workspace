@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, render_template
 import logging
 import threading
 import time
@@ -8,189 +8,203 @@ from topology_manager import TopologyGraph
 
 app = Flask(__name__)
 
-# 配置日志
+log = logging.getLogger('werkzeug')
+log.setLevel(logging.ERROR)
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# 全局拓扑对象
-global_graph = None
-APP_ID = "org.example.arp"
+APP_ID = "org.example.onosapi"
+global_graph = TopologyGraph()
+link_stats = {}
+host_ip_map = {}
 
-# 流表模板
 flows_template = {
   "priority": 40001,
   "timeout": 0,
   "isPermanent": True,
   "deviceId": "",
-  "selector": {
-    "criteria": [
-      {
-        "type": "IN_PORT",
-        "port": ""
-      },
-      {
-        "type": "ETH_DST",
-        "mac": ""
-      }
-    ]
-  },
-  "treatment": {
-    "instructions": [
-      {
-        "type": "OUTPUT",
-        "port": ""
-      }
-    ]
-  }
+  "selector": {"criteria": [{"type": "IN_PORT", "port": ""}, {"type": "ETH_DST", "mac": ""}]},
+  "treatment": {"instructions": [{"type": "OUTPUT", "port": ""}]}
 }
 
-def update_topology_task():
-    """每 5 秒更新一次拓扑"""
-    global global_graph
-    while True:
-        try:
-            logger.info("正在更新网络拓扑...")
-            links = onos_api.get_links_by_topology_id()
-            hosts = onos_api.get_hosts()
-            global_graph = TopologyGraph(links, hosts)
-            logger.info(f"拓扑更新完成: {len(global_graph.get_all_devices())} devices, {len(hosts)} hosts")
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+@app.route('/api/topology', methods=['GET'])
+def get_topology():
+    nodes = set()
+    processed_pairs = set() 
+    links = []
+    
+    adj = global_graph.get_graph_dict()
+    for src, neighbors in adj.items():
+        nodes.add(src)
+        for dst, ports in neighbors.items():
+            nodes.add(dst)
             
-        except Exception as e:
-            logger.error(f"拓扑更新失败: {e}")
-        
-        time.sleep(5)
-
-def cleanup_conflicting_flows(device_id, match_criteria):
-    try:
-        flows = onos_api.get_flows(device_id)
-        if not flows:
-            return
-
-        target_eth_dst = match_criteria.get("ETH_DST")
-        target_in_port = match_criteria.get("IN_PORT")
-
-        for flow in flows:
-            flow_app_id = flow.get("appId")
-            if flow_app_id != APP_ID:
+            pair_key = tuple(sorted((src, dst)))
+            if pair_key in processed_pairs:
                 continue
-
-            criteria_list = flow.get("selector", {}).get("criteria", [])
+            processed_pairs.add(pair_key)
             
-            # ONOS criteria 示例: {"type": "ETH_DST", "mac": "..."}
-            criteria_map = {c.get("type"): c for c in criteria_list}
-
-            existing_mac = criteria_map.get("ETH_DST", {}).get("mac")
-
-            if existing_mac and existing_mac.upper() == target_eth_dst.upper():
-                logger.info(f"清理旧流表: dev={device_id}, flowId={flow.get('id')}, mac={existing_mac}")
-                onos_api.delete_flow(device_id, flow.get('id'))
-                time.sleep(0.1) 
+            key_fwd = f"{src}->{dst}"
+            lat_fwd = link_stats.get(key_fwd, {}).get("latency", 0)
             
-    except Exception as e:
-        logger.warning(f"清理流表异常: {e}")
+            key_rev = f"{dst}->{src}"
+            lat_rev = link_stats.get(key_rev, {}).get("latency", 0)
 
-def install_path_flows(src_host_id, dst_host_id, src_mac, dst_mac):
-    if not global_graph:
-        logger.warning("拓扑尚未就绪")
-        return False
-    path = global_graph.find_path(src_host_id, dst_host_id)
-    if not path:
-        logger.warning(f"找不到路径: {src_host_id} -> {dst_host_id}")
-        return False
-    for i in range(1, len(path) - 1):
-        prev_node = path[i-1]
-        curr_node = path[i]
-        next_node = path[i+1]
-        if not curr_node.startswith("of:"):
-            continue
-        link_in = global_graph.get_port_to_neighbor(prev_node, curr_node)
-        link_out = global_graph.get_port_to_neighbor(curr_node, next_node)
-        if not link_in or not link_out:
-            logger.error(f"链路缺失: {prev_node}-{curr_node}-{next_node}")
-            return False
-        in_port = link_in['dst_port']
-        out_port = link_out['src_port']
-        install_flow_rule(curr_node, in_port, out_port, dst_mac)
-        install_flow_rule(curr_node, out_port, in_port, src_mac)
+            val_fwd = round(float(lat_fwd), 1)
+            val_rev = round(float(lat_rev), 1)
 
-    return True
+            links.append({
+                "source": pair_key[0],
+                "target": pair_key[1],
+                "latency_fwd": val_fwd if f"{pair_key[0]}->{pair_key[1]}" == key_fwd else val_rev,
+                "latency_rev": val_rev if f"{pair_key[0]}->{pair_key[1]}" == key_fwd else val_fwd,
+                "src_port": ports['src_port'],
+                "dst_port": ports['dst_port']
+            })
+            
+    node_list = [{"id": n, "group": 1 if n.startswith("of:") else 2} for n in list(nodes)]
+    return jsonify({"nodes": node_list, "links": links})
 
-def install_flow_rule(device_id, in_port, out_port, match_dst_mac):
-    match_criteria = {
-        "ETH_DST": match_dst_mac,
-        "IN_PORT": in_port
-    }
-    cleanup_conflicting_flows(device_id, match_criteria)
+@app.route('/api/latency', methods=['POST'])
+def handle_latency():
+    data = request.json
+    src = data.get('src_device')
+    src_port = data.get('src_port', '?')
+    dst = data.get('dst_device')
+    dst_port = data.get('dst_port', '?')
+    ts = data.get('timestamp')
     
-    # 3. 构造新流表
-    flow = copy.deepcopy(flows_template)
-    flow["deviceId"] = device_id
-    # 入端口
-    flow["selector"]["criteria"][0]["port"] = in_port
-    # 目的MAC
-    flow["selector"]["criteria"][1]["mac"] = match_dst_mac
-    # 从出端口转发
-    flow["treatment"]["instructions"][0]["port"] = out_port
+    if 'latency_ms' in data:
+        latency = data.get('latency_ms')
+    else:
+        latency = data.get('latency_us', 0) / 1000.0
     
-    logger.info(f"下发流表: Dev={device_id} Match=[In:{in_port}, Dst:{match_dst_mac}] -> Out:{out_port}")
-    onos_api.create_flow(flow, device_id, appId=APP_ID)
+    if src == "unknown":
+        logger.warning(f"Ignored report with unknown source -> {dst}")
+        return jsonify({"status": "ignored"}), 200
+
+    if str(src_port) == '?' or str(dst_port) == '?':
+         logger.warning(f"Ignored link with invalid port: {src}:{src_port} -> {dst}:{dst_port}")
+         return jsonify({"status": "ignored_invalid_port"}), 200
+
+    global_graph.add_link(src, dst, src_port, dst_port)
+    
+    key = f"{src}->{dst}"
+    link_stats[key] = {"latency": latency, "timestamp": ts}
+    
+    return jsonify({"status": "ok"})
 
 @app.route('/api/report/arp', methods=['POST'])
 def report_arp():
     try:
         data = request.json
-        if not data:
-            return jsonify({"status": "error", "message": "No JSON data"}), 400
         dpid = data.get('dpid')
         port = data.get('port')
+        src_mac = data.get('src_mac') 
         src_ip = data.get('src_ip')
-        src_mac = data.get('src_mac')
         dst_ip = data.get('dst_ip')
-        logger.info(f"收到 ARP 上报: SRC[{src_ip}/{src_mac}] -> DST[{dst_ip}] @ {dpid}:{port}")
-        target_host = None
-        target_mac = None
-        if global_graph:
-            hosts = onos_api.get_hosts()
-            for h in hosts:
-                if dst_ip in h.get('ipAddresses', []):
-                    target_host = h['id']
-                    target_mac = h['mac']
-                    break
         
-        if target_host:
-            src_host_id = f"{src_mac}/None" 
-            success = install_path_flows(src_host_id, target_host, src_mac, target_mac) # src_host_id is guessed
+        if src_ip and src_mac:
+            host_ip_map[src_ip] = {
+                "mac": src_mac,
+                "dpid": dpid,
+                "port": port
+            }
+            logger.info(f"Host Discovered: {src_ip} -> {src_mac} @ {dpid}/{port}")
+        
+        src_host_id = f"{src_mac}/None" 
+        global_graph.add_link(src_host_id, dpid, -1, port)
+        global_graph.add_link(dpid, src_host_id, port, -1)
+        
+        if dst_ip in host_ip_map:
+            dst_info = host_ip_map[dst_ip]
+            dst_mac = dst_info['mac']
             
-            if success:
-                #代答 ARP 
-                response_payload = {
-                    "action": "packet-out",
-                    "payload": {
-                        "type": "ARP_REPLY",
-                        "dpid": dpid,
-                        "port": port,
-                        "src_mac": target_mac, # 目标主机
-                        "src_ip": dst_ip,
-                        "dst_mac": src_mac,    # 请求者
-                        "dst_ip": src_ip
-                    }
-                }
-                return jsonify(response_payload), 200
-            else:
-                logger.warning("路径安装失败，无法代答")
+            logger.info(f"Target {dst_ip} found! Preparing ARP Reply and Flows...")
+            
+            install_path_flows(src_host_id, f"{dst_mac}/None", src_ip, dst_ip)
+            
+            reply_instruction = {
+                "type": "ARP_REPLY",
+                "src_mac": dst_mac,
+                "src_ip": dst_ip,
+                "dst_mac": src_mac,
+                "dst_ip": src_ip,
+                "dpid": dpid,
+                "port": port
+            }
+            
+            return jsonify({
+                "status": "processed",
+                "action": "packet-out",
+                "payload": reply_instruction
+            }), 200
+            
         else:
-            logger.info("目标主机未知，无法处理 (等待目标主机发包)")
-            # 此时无法做任何事，从网络视角看，ARP 会超时
-        
-        return jsonify({"status": "success", "message": "No path or host found"}), 200
+            logger.info(f"Target {dst_ip} unknown. Waiting for discovery.")
+            return jsonify({"status": "received"}), 200
         
     except Exception as e:
-        logger.error(f"处理异常: {e}")
-        return jsonify({"status": "error", "message": str(e)}), 500
+        logger.error(f"ARP Error: {e}")
+        return jsonify({"status": "error"}), 500
+
+def install_path_flows(src_id, dst_id, src_ip, dst_ip):
+    path = global_graph.find_path(src_id, dst_id)
+    if not path:
+        logger.error("No path found between hosts!")
+        return
+
+    logger.info(f"Path Calculation: {path}")
+    
+    onos_api.clean_flows(except_id="org.onosproject.core")
+    
+    src_info = host_ip_map[src_ip]
+    dst_info = host_ip_map[dst_ip]
+    
+    for i in range(1, len(path) - 1):
+        curr_sw = path[i]
+        prev_node = path[i-1]
+        next_node = path[i+1]
+        
+        if curr_sw not in global_graph.adj or prev_node not in global_graph.adj[curr_sw] or next_node not in global_graph.adj[curr_sw]:
+             logger.error(f"Link missing in AJD for {prev_node}-{curr_sw}-{next_node}")
+             continue
+             
+        port_to_prev = global_graph.adj[curr_sw][prev_node]['src_port']
+        
+        port_to_next = global_graph.adj[curr_sw][next_node]['src_port']
+
+        if str(port_to_prev) == '?' or str(port_to_next) == '?':
+            logger.error(f"Cannot install flow on {curr_sw}: Invalid port detected. PrevPort={port_to_prev}, NextPort={port_to_next}")
+            continue
+
+        logger.info(f"Installing Flow on {curr_sw}: to_prev={port_to_prev}, to_next={port_to_next}")
+        
+        flow_fwd = copy.deepcopy(flows_template)
+        flow_fwd['deviceId'] = curr_sw
+        flow_fwd['selector']['criteria'] = [
+            {"type": "ETH_DST", "mac": dst_info['mac']}
+        ]
+        flow_fwd['treatment']['instructions'] = [
+            {"type": "OUTPUT", "port": port_to_next}
+        ]
+        onos_api.create_flow(flow_fwd, curr_sw, APP_ID)
+        
+        flow_rev = copy.deepcopy(flows_template)
+        flow_rev['deviceId'] = curr_sw
+        flow_rev['selector']['criteria'] = [
+            {"type": "ETH_DST", "mac": src_info['mac']}
+        ]
+        flow_rev['treatment']['instructions'] = [
+            {"type": "OUTPUT", "port": port_to_prev}
+        ]
+        onos_api.create_flow(flow_rev, curr_sw, APP_ID)
 
 if __name__ == '__main__':
-    topo_thread = threading.Thread(target=update_topology_task, daemon=True)
-    topo_thread.start()
-    
-    logger.info("启动 ARP 监听微服务 (Port 5000)...")
+    logger.info("Starting Topology Service on :5000")
     app.run(host='0.0.0.0', port=5000)

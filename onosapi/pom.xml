@@ -21,7 +21,7 @@
         <!-- 1. 显式定义版本号，解决变量报红问题 -->
         <onos.version>2.7.0</onos.version>
 
-        <!-- 2. 应用的基础信息 -->
+        <onos.app.requires>org.onosproject.protocols.p4runtime</onos.app.requires> 
         <onos.app.name>org.example.onosapi</onos.app.name>
         <onos.app.title>My ONOS App</onos.app.title>
         <onos.app.origin>My Company</onos.app.origin>
@@ -116,8 +116,12 @@
             <plugin>
                 <groupId>org.onosproject</groupId>
                 <artifactId>onos-maven-plugin</artifactId>
-                <!-- 这里不需要版本号，因为会从 parent 继承 -->
+                <!-- disable swagger since it fails to parse java 11 syntax/lambdas in some cases -->
                 <executions>
+                    <execution>
+                        <id>swagger</id>
+                        <phase>none</phase>
+                    </execution>
                     <execution>
                         <id>cfg</id>
                         <phase>package</phase>

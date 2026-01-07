@@ -99,6 +99,14 @@ def run():
 
     # 启动网络
     net.start()
+
+    # 发送免费 ARP 以快速通告主机位置，并在控制器注册
+    print( "*** Sending Gratuitous ARP to pre-populate controller tables..." )
+    for host in net.hosts:
+        # -U 更新邻居ARP缓存 (Gratuitous ARP)
+        # -c 1 发送一次
+        host.cmd(f'arping -U -c 1 -I {host.name}-eth0 {host.IP()}')
+
     print( "*** Topology is up, press Ctrl-D to exit" )
     
     # 进入命令行界面
